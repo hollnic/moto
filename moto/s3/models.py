@@ -202,6 +202,14 @@ class FakeKey(BaseModel, ManagedState):
     def set_acl(self, acl):
         self.acl = acl
 
+    def append_to_value(self, value):
+        self.contentsize += len(value)
+        self._value_buffer.seek(0, os.SEEK_END)
+        self._value_buffer.write(value)
+        self.last_modified = datetime.datetime.utcnow()
+        self._etag = None  # must recalculate etag
+        self._version_id = str(random.uuid4()) if self._is_versioned else None
+
     def restore(self, days):
         self._expiry = datetime.datetime.utcnow() + datetime.timedelta(days)
 
@@ -365,13 +373,11 @@ class FakeMultipart(BaseModel):
         self.sse_encryption = sse_encryption
         self.kms_key_id = kms_key_id
 
-    def complete(self, body):
+    def complete(self, body, key):
         decode_hex = codecs.getdecoder("hex_codec")
-        total = bytearray()
         md5s = bytearray()
-
-        last = None
         count = 0
+        last_part_size: int = None
         for pn, etag in body:
             part = self.parts.get(pn)
             part_etag = None
@@ -380,11 +386,12 @@ class FakeMultipart(BaseModel):
                 etag = etag.replace('"', "")
             if part is None or part_etag != etag:
                 raise InvalidPart()
-            if last is not None and last.contentsize < S3_UPLOAD_PART_MIN_SIZE:
+            if last_part_size is not None and last_part_size < S3_UPLOAD_PART_MIN_SIZE:
                 raise EntityTooSmall()
+            last_part_size = part.contentsize
             md5s.extend(decode_hex(part_etag)[0])
-            total.extend(part.value)
-            last = part
+            key.append_to_value(part.value)
+            self.parts.pop(pn)
             count += 1
 
         if count == 0:
@@ -392,7 +399,7 @@ class FakeMultipart(BaseModel):
 
         etag = md5_hash()
         etag.update(bytes(md5s))
-        return total, "{0}-{1}".format(etag.hexdigest(), count)
+        return key, "{0}-{1}".format(etag.hexdigest(), count)
 
     def set_part(self, part_id, value):
         if part_id < 1:
@@ -1923,16 +1930,15 @@ class S3Backend(BaseBackend, CloudWatchMetricProvider):
     def complete_multipart(self, bucket_name, multipart_id, body):
         bucket = self.get_bucket(bucket_name)
         multipart = bucket.multiparts[multipart_id]
-        value, etag = multipart.complete(body)
+        key = self.put_object(bucket_name, multipart.key_name, b"", multipart=multipart)
+        value, etag = multipart.complete(body, key)
+        key._etag = etag
         if value is None:
             return
         del bucket.multiparts[multipart_id]
 
-        key = self.put_object(
-            bucket_name, multipart.key_name, value, etag=etag, multipart=multipart
-        )
         key.set_metadata(multipart.metadata)
-        return key
+        return key, multipart
 
     def abort_multipart_upload(self, bucket_name, multipart_id):
         bucket = self.get_bucket(bucket_name)
@@ -1979,14 +1985,6 @@ class S3Backend(BaseBackend, CloudWatchMetricProvider):
         bucket = self.get_bucket(bucket_name)
         bucket.multiparts[multipart.id] = multipart
         return multipart.id
-
-    def complete_multipart_upload(self, bucket_name, multipart_id, body):
-        bucket = self.get_bucket(bucket_name)
-        multipart = bucket.multiparts[multipart_id]
-        value, etag = multipart.complete(body)
-        if value is not None:
-            del bucket.multiparts[multipart_id]
-        return multipart, value, etag
 
     def get_all_multiparts(self, bucket_name):
         bucket = self.get_bucket(bucket_name)

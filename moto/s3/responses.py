@@ -2023,23 +2023,12 @@ class S3Response(BaseResponse):
             body = self._complete_multipart_body(body)
             multipart_id = query["uploadId"][0]
 
-            multipart, value, etag = self.backend.complete_multipart_upload(
+            key, multipart = self.backend.complete_multipart(
                 bucket_name, multipart_id, body
             )
-            if value is None:
+            if key.contentsize == 0:
                 return 400, {}, ""
 
-            key = self.backend.put_object(
-                bucket_name,
-                multipart.key_name,
-                value,
-                storage=multipart.storage,
-                etag=etag,
-                multipart=multipart,
-                encryption=multipart.sse_encryption,
-                kms_key_id=multipart.kms_key_id,
-            )
-            key.set_metadata(multipart.metadata)
             self.backend.set_key_tags(key, multipart.tags)
             self.backend.put_object_acl(bucket_name, key.name, multipart.acl)
 
